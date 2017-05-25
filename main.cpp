@@ -1,4 +1,4 @@
-// TODO : correctly handle pdf conversion, pdfA -> pdfW
+// TODO : avoid segfault when using openmp, for now, just disable it
 
 #include <math.h>   // smallpt, a Path Tracer by Kevin Beason, 2008 
 #include <stdlib.h> // Make : g++ -O3 -fopenmp smallpt.cpp -o smallpt 
@@ -64,7 +64,7 @@ public:
     }
 };
 
-const double alpha = 0.5; // learning rate
+const double alpha = 0.1; // learning rate
 const double initial_q_value = 1.0;
 
 class QFunc
@@ -248,6 +248,55 @@ public:
             break;
         }
     }
+    Vec sampleRef(StratSample& s, const Vec& wi, const Vec& nl, Vec& weight)
+    {
+        switch (type)
+        {
+        default:
+        case DIFF:
+        {
+            double r1 = 2 * M_PI * s.x, r2 = s.y;
+            double sin_theta = sqrt(r2), cos_theta = sqrt(1 - r2);
+            Vec w = nl, u = ((fabs(w.x) > .1 ? Vec(0, 1) : Vec(1)) % w).norm(), v = w%u;
+            Vec d = (u*cos(r1)*sin_theta + v*sin(r1)*sin_theta + w*cos_theta).norm();
+            weight = color;
+            return d;
+        }
+            break;
+        case SPEC:
+        {
+            weight = color;
+            return nl * 2 * nl.dot(wi) - wi;
+        }
+            break;
+        case REFR:
+        {
+            Vec refl = nl * 2 * nl.dot(wi) - wi;     // Ideal dielectric REFRACTION 
+            bool into = wi.dot(nl) > 0;                // Ray from outside going in? 
+            Vec orient_n = into ? nl : nl * -1;
+            double nc = 1, nt = 1.5, nnt = into ? nc / nt : nt / nc, ddn = -wi.dot(orient_n), cos2t;
+            if ((cos2t = 1 - nnt*nnt*(1 - ddn*ddn)) < 0)    // Total internal reflection 
+            {
+                weight = color;
+                return refl;
+            }
+            Vec tdir = (wi*-nnt - nl*((into ? 1 : -1)*(ddn*nnt + sqrt(cos2t)))).norm();
+            double a = nt - nc, b = nt + nc, R0 = a*a / (b*b), c = 1 - (into ? -ddn : tdir.dot(nl));
+            double Re = R0 + (1 - R0)*c*c*c*c*c, Tr = 1 - Re, P = .25 + .5*Re, RP = Re / P, TP = Tr / (1 - P);
+            if (s.x < P) // Russian roulette 
+            {
+                weight = color * RP;
+                return refl;
+            }
+            else
+            {
+                weight = color * TP;
+                return tdir;
+            }
+        }
+            break;
+        }
+    }
 };
 class AABB
 {
@@ -356,29 +405,31 @@ Vec radianceRL(const Ray &r, int depth, unsigned short *Xi,
     Vec new_dir = obj.mat().sample(s, r.d * -1, n, weight);
     return obj.e + f.mult(radianceRL(Ray(x, new_dir), depth, Xi, s.stratum_idx, &obj)).mult(weight);
 }
-// Vec radiance(const Ray &r, int depth, unsigned short *Xi,
-//     int last_stratum_idx = -1, const Sphere *last_obj = nullptr)
-// {
-//     double t;                               // distance to intersection 
-//     int id = 0;                               // id of intersected object 
-//     if (!intersect(r, t, id)) return Vec(); // if miss, return black 
-//     const Sphere &obj = spheres[id];        // the hit object 
-// 
-//     Vec x = r.o + r.d*t, n = (x - obj.p).norm(), nl = n.dot(r.d) < 0 ? n : n*-1, f = obj.c;
-//     scene_box.enclose(x);
-// 
-//     if (++depth > 10 || obj.e.avg() > 0) return obj.e;
-// 
-// 
-//     Vec weight;
-//     Vec new_dir = obj.mat().sample(rand01(), rand01(), r.d * -1, n, weight);
-//     return obj.e + f.mult(radiance(Ray(x, new_dir), depth, Xi)).mult(weight);
-// }
+Vec radianceRef(const Ray &r, int depth, unsigned short *Xi,
+    int last_stratum_idx = -1, const Sphere *last_obj = nullptr)
+{
+    double t;                               // distance to intersection 
+    int id = 0;                               // id of intersected object 
+    if (!intersect(r, t, id)) return Vec(); // if miss, return black 
+    const Sphere &obj = spheres[id];        // the hit object 
+
+    Vec x = r.o + r.d*t, n = (x - obj.p).norm(), nl = n.dot(r.d) < 0 ? n : n*-1, f = obj.c;
+    scene_box.enclose(x);
+
+    if (++depth > 10 || obj.e.avg() > 0) return obj.e;
+
+    Vec weight;
+    StratSample s;
+    s.x = rand01();
+    s.y = rand01();
+    Vec new_dir = obj.mat().sampleRef(s, r.d * -1, n, weight);
+    return obj.e + f.mult(radianceRef(Ray(x, new_dir), depth, Xi)).mult(weight);
+}
 int main(int argc, char *argv[]){
-    int w = 256, h = 256, samps = 100; // # samples 
+    int w = 256, h = 256, samps = 1000; // # samples 
     Ray cam(Vec(50, 52, 295.6), Vec(0, -0.042612, -1).norm()); // cam pos, dir 
     Vec cx = Vec(w*.5135 / h), cy = (cx%cam.d).norm()*.5135, r, *c = new Vec[w*h];
-#pragma omp parallel for schedule(dynamic, 1) private(r)       // OpenMP 
+// #pragma omp parallel for schedule(dynamic, 1) private(r)       // OpenMP 
     for (int y = 0; y < h; y++){                       // Loop over image rows 
         fprintf(stderr, "\rRendering (%d spp) %5.2f%%", samps * 4, 100.*y / (h - 1));
         for (unsigned short x = 0, Xi[3] = { 0, 0, y*y*y }; x < w; x++)   // Loop cols 
@@ -390,6 +441,7 @@ int main(int argc, char *argv[]){
                         Vec d = cx*(((sx + .5 + dx) / 2 + x) / w - .5) +
                             cy*(((sy + .5 + dy) / 2 + y) / h - .5) + cam.d;
                         r = r + radianceRL(Ray(cam.o + d * 140, d.norm()), 0, Xi)*(1. / samps);
+//                         r = r + radianceRef(Ray(cam.o + d * 140, d.norm()), 0, Xi)*(1. / samps);
                     } // Camera rays are pushed ^^^^^ forward to start in interior 
                     c[i] = c[i] + Vec(clamp(r.x), clamp(r.y), clamp(r.z))*.25;
                 }
