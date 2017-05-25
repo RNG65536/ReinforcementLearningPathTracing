@@ -1,3 +1,5 @@
+// TODO : correctly handle pdf conversion, pdfA -> pdfW
+
 #include <math.h>   // smallpt, a Path Tracer by Kevin Beason, 2008 
 #include <stdlib.h> // Make : g++ -O3 -fopenmp smallpt.cpp -o smallpt 
 #include <stdio.h>  //        Remove "-fopenmp" for g++ version < 4.2 
@@ -7,6 +9,7 @@
 #include <sstream>
 #include <iostream>
 #include <vector>
+#include <numeric>
 #include <unordered_map>
 #include <cassert>
 #include <mutex>
@@ -36,6 +39,8 @@ struct StratSample
 {
     double x, y;
     int stratum_idx;
+    double pdf;
+    int n_strata;
 };
 class StratifiedSampler
 {
@@ -73,58 +78,65 @@ public:
     QFunc(const Vec& id, const Vec& p)
         : _id(id), _p(p)
     {
-        s.push_back(StratifiedSampler(0, 0, 0.5, 0, 0.5));
-        s.push_back(StratifiedSampler(1, 0.5, 1, 0, 0.5));
-        s.push_back(StratifiedSampler(2, 0, 0.5, 0.5, 1));
-        s.push_back(StratifiedSampler(3, 0.5, 1, 0.5, 1));
-        q.push_back(initial_q_value);
-        q.push_back(initial_q_value);
-        q.push_back(initial_q_value);
-        q.push_back(initial_q_value);
+        int n = 0;
+        for (int j = 0; j < 5; j++)
+        {
+            for (int i = 0; i < 5; i++)
+            {
+                s.push_back(StratifiedSampler(n++, i * 0.2, (i + 1) * 0.2, j * 0.2, (j + 1) * 0.2));
+            }
+        }
+        q.resize(5 * 5);
+        q.assign(q.size(), initial_q_value);
     }
-
-    StratifiedSampler& choose()
+    int size() { return q.size(); }
+    StratifiedSampler& choose(double& pdf)
     {
-        double inv_q_sum = 1.0 / (q[0] + q[1] + q[2] + q[3]);
-        float r = rand01();
-        if (r < (q[0]) * inv_q_sum)
+        double inv_q_sum = 0;
+        for (int i = 0; i < q.size(); i++)
         {
-            return s[0];
+            inv_q_sum += q[i];
         }
-        else 
-        if (r < (q[0] + q[1]) * inv_q_sum)
+        inv_q_sum = 1.0 / inv_q_sum;
+        double r = rand01();
+
+        double sum = 0;
+        for (int i = 0; i < q.size(); i++)
         {
-            return s[1];
+            sum += q[i];
+            if (r < sum * inv_q_sum)
+            {
+                pdf = q[i] * inv_q_sum;
+                return s[i];
+            }
         }
-        else 
-        if (r < (q[0] + q[1] + q[2]) * inv_q_sum)
-        {
-            return s[2];
-        }
-        else
-        {
-            return s[3];
-        }
+        pdf = q[q.size() - 1] * inv_q_sum;
+        return s[q.size() - 1];
     }
 
     double q_mean()
     {
-        return (q[0] + q[1] + q[2] + q[3]) * 0.25;
+        double ret = 0;
+        for (int i = 0; i < q.size(); i++)
+        {
+            ret += q[i];
+        }
+        return ret / q.size();
     }
 
-    void update(float value, int str_idx)
+    void update(double value, int str_idx)
     {
         q[str_idx] = q[str_idx] * (1 - alpha) + value * alpha;
     }
 
-    Vec& id()
-    {
-        return _id;
-    }
-    Vec& p()
-    {
-        return _p;
-    }
+//     Vec& id()
+//     {
+//         return _id;
+//     }
+//     Vec& p()
+//     {
+//         return _p;
+//     }
 };
 
 typedef int HashId;
@@ -181,17 +193,24 @@ public:
     {
 
     }
-    Vec sample(double rnd1, double rnd2, const Vec& wi, const Vec& nl, Vec& weight)
+    Vec sample(StratSample& s, const Vec& wi, const Vec& nl, Vec& weight)
     {
         switch (type)
         {
         default:
         case DIFF:
         {
-            double r1 = 2 * M_PI * rnd1, r2 = rnd2, r2s = sqrt(r2);
+            double r1 = 2 * M_PI * s.x, r2 = M_PI * s.y * 0.5;
+            double cos_theta = cos(r2), sin_theta = sqrt(1 - cos_theta * cos_theta);
             Vec w = nl, u = ((fabs(w.x) > .1 ? Vec(0, 1) : Vec(1)) % w).norm(), v = w%u;
-            Vec d = (u*cos(r1)*r2s + v*sin(r1)*r2s + w*sqrt(1 - r2)).norm();
-            weight = color;
+            Vec d = (u*cos(r1)*sin_theta + v*sin(r1)*sin_theta + w*cos_theta).norm();
+
+            // full
+//             double pdf = s.pdf * s.n_strata / (2 * M_PI * 0.5 * M_PI * sin_theta);
+//             weight = color * (cos_theta / M_PI / pdf);
+            //simplified
+            weight = color * (cos_theta * (M_PI * sin_theta) / (s.pdf * s.n_strata));
+
             return d;
         }
             break;
@@ -215,7 +234,7 @@ public:
             Vec tdir = (wi*-nnt - nl*((into ? 1 : -1)*(ddn*nnt + sqrt(cos2t)))).norm();
             double a = nt - nc, b = nt + nc, R0 = a*a / (b*b), c = 1 - (into ? -ddn : tdir.dot(nl));
             double Re = R0 + (1 - R0)*c*c*c*c*c, Tr = 1 - Re, P = .25 + .5*Re, RP = Re / P, TP = Tr / (1 - P);
-            if (rnd1 < P) // Russian roulette 
+            if (s.x < P) // Russian roulette 
             {
                 weight = color * RP;
                 return refl;
@@ -327,32 +346,36 @@ Vec radianceRL(const Ray &r, int depth, unsigned short *Xi,
 
     if (++depth > 10 || obj.e.avg() > 0) return obj.e;
 
-    auto s = q_curr->choose().sample();
+    double pdf;
+    auto& q1 = q_curr->choose(pdf);
+    auto s = q1.sample();
+    s.pdf = pdf;
+    s.n_strata = q_curr->size();
 
     Vec weight;
-    Vec new_dir = obj.mat().sample(s.x, s.y, r.d * -1, n, weight);
+    Vec new_dir = obj.mat().sample(s, r.d * -1, n, weight);
     return obj.e + f.mult(radianceRL(Ray(x, new_dir), depth, Xi, s.stratum_idx, &obj)).mult(weight);
 }
-Vec radiance(const Ray &r, int depth, unsigned short *Xi,
-    int last_stratum_idx = -1, const Sphere *last_obj = nullptr)
-{
-    double t;                               // distance to intersection 
-    int id = 0;                               // id of intersected object 
-    if (!intersect(r, t, id)) return Vec(); // if miss, return black 
-    const Sphere &obj = spheres[id];        // the hit object 
-
-    Vec x = r.o + r.d*t, n = (x - obj.p).norm(), nl = n.dot(r.d) < 0 ? n : n*-1, f = obj.c;
-    scene_box.enclose(x);
-
-    if (++depth > 10 || obj.e.avg() > 0) return obj.e;
-
-
-    Vec weight;
-    Vec new_dir = obj.mat().sample(rand01(), rand01(), r.d * -1, n, weight);
-    return obj.e + f.mult(radiance(Ray(x, new_dir), depth, Xi)).mult(weight);
-}
+// Vec radiance(const Ray &r, int depth, unsigned short *Xi,
+//     int last_stratum_idx = -1, const Sphere *last_obj = nullptr)
+// {
+//     double t;                               // distance to intersection 
+//     int id = 0;                               // id of intersected object 
+//     if (!intersect(r, t, id)) return Vec(); // if miss, return black 
+//     const Sphere &obj = spheres[id];        // the hit object 
+// 
+//     Vec x = r.o + r.d*t, n = (x - obj.p).norm(), nl = n.dot(r.d) < 0 ? n : n*-1, f = obj.c;
+//     scene_box.enclose(x);
+// 
+//     if (++depth > 10 || obj.e.avg() > 0) return obj.e;
+// 
+// 
+//     Vec weight;
+//     Vec new_dir = obj.mat().sample(rand01(), rand01(), r.d * -1, n, weight);
+//     return obj.e + f.mult(radiance(Ray(x, new_dir), depth, Xi)).mult(weight);
+// }
 int main(int argc, char *argv[]){
-    int w = 512, h = 512, samps = 10; // # samples 
+    int w = 256, h = 256, samps = 100; // # samples 
     Ray cam(Vec(50, 52, 295.6), Vec(0, -0.042612, -1).norm()); // cam pos, dir 
     Vec cx = Vec(w*.5135 / h), cy = (cx%cam.d).norm()*.5135, r, *c = new Vec[w*h];
 #pragma omp parallel for schedule(dynamic, 1) private(r)       // OpenMP 
